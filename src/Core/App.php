@@ -189,6 +189,7 @@ class App
         $this->router->map('POST', '/settings/templates/add', 'SettingsController@addTemplate');
         $this->router->map('POST', '/settings/templates/[i:id]/edit', 'SettingsController@editTemplate');
         $this->router->map('POST', '/settings/templates/[i:id]/delete', 'SettingsController@deleteTemplate');
+        $this->router->map('POST', '/settings/templates/[i:id]/duplicate', 'SettingsController@duplicateTemplate');
         $this->router->map('POST', '/settings/branding', 'SettingsController@saveBranding');
         $this->router->map('POST', '/settings/push', 'SettingsController@savePush');
 

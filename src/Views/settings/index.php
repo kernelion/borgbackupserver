@@ -1849,6 +1849,10 @@ document.addEventListener('change', function (e) {
                             <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#edit-tpl-<?= $tpl['id'] ?>">
                                 <i class="bi bi-pencil"></i>
                             </button>
+                            <form method="POST" action="/settings/templates/<?= $tpl['id'] ?>/duplicate" class="d-inline">
+                                <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                                <button class="btn btn-sm btn-outline-secondary" title="Duplicate"><i class="bi bi-copy"></i></button>
+                            </form>
                             <form method="POST" action="/settings/templates/<?= $tpl['id'] ?>/delete" class="d-inline" data-confirm="Delete this template?" data-confirm-danger>
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                                 <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
@@ -1860,7 +1864,7 @@ document.addEventListener('change', function (e) {
                         $editHasComp = (bool)preg_match('/--compression\s+(\S+)/', $editAdv, $editCompMatch);
                         $editCompSpec = $editHasComp ? $editCompMatch[1] : 'lz4';
                     ?>
-                    <tr class="collapse" id="edit-tpl-<?= $tpl['id'] ?>">
+                    <tr class="collapse<?= (int) ($_GET['edit'] ?? 0) === (int) $tpl['id'] ? ' show' : '' ?>" id="edit-tpl-<?= $tpl['id'] ?>">
                         <td colspan="6">
                             <form method="POST" action="/settings/templates/<?= $tpl['id'] ?>/edit" class="p-2 tpl-form">
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">

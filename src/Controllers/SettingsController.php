@@ -379,6 +379,41 @@ class SettingsController extends Controller
         $this->redirect('/settings?tab=templates');
     }
 
+    /** Copy a template so a variant can start from it (#543). */
+    public function duplicateTemplate(int $id): void
+    {
+        $this->requireAdmin();
+        $this->verifyCsrf();
+
+        $tpl = $this->db->fetchOne("SELECT * FROM backup_templates WHERE id = ?", [$id]);
+        if (!$tpl) {
+            $this->flash('danger', 'Template not found.');
+            $this->redirect('/settings?tab=templates');
+        }
+
+        // "Web Server (copy)", then "(copy 2)" and so on if that is taken.
+        // The column is VARCHAR(100), so trim the base rather than the suffix.
+        $names = array_column($this->db->fetchAll("SELECT name FROM backup_templates"), 'name');
+        for ($n = 1; ; $n++) {
+            $suffix = $n === 1 ? ' (copy)' : " (copy {$n})";
+            $name = mb_substr($tpl['name'], 0, 100 - mb_strlen($suffix)) . $suffix;
+            if (!in_array($name, $names, true)) {
+                break;
+            }
+        }
+
+        $newId = $this->db->insert('backup_templates', [
+            'name' => $name,
+            'description' => $tpl['description'],
+            'directories' => $tpl['directories'],
+            'excludes' => $tpl['excludes'],
+            'advanced_options' => $tpl['advanced_options'],
+        ]);
+
+        $this->flash('success', "Template duplicated as \"{$name}\".");
+        $this->redirect('/settings?tab=templates&edit=' . (int) $newId);
+    }
+
     public function editTemplate(int $id): void
     {
         $this->requireAdmin();
