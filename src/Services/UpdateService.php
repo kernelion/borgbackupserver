@@ -330,8 +330,7 @@ class UpdateService
             ];
         }
 
-        // Set up log file
-        $logFile = '/tmp/bbs-upgrade-' . getmypid() . '.log';
+        $logFile = $this->upgradeLogPath();
         $this->setSetting('upgrade_in_progress', '1');
         $this->setSetting('upgrade_started_at', date('Y-m-d H:i:s'));
         $this->setSetting('upgrade_log_file', $logFile);
@@ -353,6 +352,32 @@ class UpdateService
         $this->setSetting('upgrade_pid', $pid);
 
         return ['success' => true, 'pid' => $pid];
+    }
+
+    /**
+     * Where the upgrade writes its log.
+     *
+     * Not /tmp. Apache runs with PrivateTmp=yes on Ubuntu, so a log the
+     * scheduler (cron) writes to /tmp is invisible to the web request that
+     * polls it. A deferred upgrade started from the scheduler then finished
+     * with nobody able to see it finish, and the upgrade page never let go.
+     */
+    private function upgradeLogPath(): string
+    {
+        $dir = $this->projectRoot . '/storage/logs';
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0755, true);
+        }
+        if (!is_dir($dir) || !is_writable($dir)) {
+            $dir = sys_get_temp_dir();
+        }
+        // /tmp used to clear these on reboot; here they'd pile up.
+        foreach (glob($dir . '/bbs-upgrade-*.log') ?: [] as $old) {
+            if (filemtime($old) < time() - 30 * 86400) {
+                @unlink($old);
+            }
+        }
+        return $dir . '/bbs-upgrade-' . getmypid() . '.log';
     }
 
     /**
@@ -431,7 +456,16 @@ class UpdateService
             }
         }
 
-        $failed = !$processRunning && !$completed && !$fallbackSuccess && !empty($log);
+        // The process is gone and left no log we can read. Don't wait forever:
+        // judge by whether the code on disk is now the version we asked for.
+        if (!$processRunning && $log === '') {
+            $wanted = ltrim($target, 'v');
+            if ($wanted !== '' && $wanted === $this->getCurrentVersion()) {
+                $fallbackSuccess = true;
+            }
+        }
+
+        $failed = !$processRunning && !$completed && !$fallbackSuccess;
 
         if ($completed || $fallbackSuccess || $failed) {
             $resultStr = ($completed || $fallbackSuccess) ? 'success' : 'failed';
