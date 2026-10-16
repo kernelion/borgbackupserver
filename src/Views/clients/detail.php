@@ -108,8 +108,11 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
             $seenAgo = 'Never';
         }
         $lastBackupLabel = $lastJob ? \BBS\Core\TimeHelper::format($lastJob['completed_at'], 'M j g:ia') : '--';
-        $lastBackupIcon = $lastJob ? ($lastJob['status'] === 'completed' ? 'check-circle-fill' : 'x-circle-fill') : 'dash-circle';
-        $lastBackupColor = $lastJob ? ($lastJob['status'] === 'completed' ? 'success' : 'danger') : 'secondary';
+        $lastBackupWarn = $lastJob && $lastJob['status'] === 'completed' && !empty($lastJob['had_warnings']);
+        $lastBackupIcon = !$lastJob ? 'dash-circle'
+            : ($lastBackupWarn ? 'exclamation-triangle-fill' : ($lastJob['status'] === 'completed' ? 'check-circle-fill' : 'x-circle-fill'));
+        $lastBackupColor = !$lastJob ? 'secondary'
+            : ($lastBackupWarn ? 'warning' : ($lastJob['status'] === 'completed' ? 'success' : 'danger'));
         ?>
         <div class="row g-2 border-top pt-3">
             <div class="col-6 col-sm-4 col-lg-2">
@@ -640,6 +643,10 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                         if ($job['status'] === 'failed' && !empty($job['error_log'])) {
                             $iconTitle = mb_substr($job['error_log'], 0, 500);
                         }
+                        if ($job['status'] === 'completed' && !empty($job['had_warnings'])) {
+                            $jIcon = 'exclamation-triangle-fill text-warning';
+                            $iconTitle = 'Completed with warnings: ' . mb_substr($job['error_log'] ?? '', 0, 500);
+                        }
                     ?>
                         <tr style="cursor: pointer;" onclick="window.location='/queue/<?= (int) $job['id'] ?>'">
                             <td class="text-center"<?= $iconTitle ? ' title="' . htmlspecialchars($iconTitle) . '"' : '' ?>>
@@ -678,8 +685,9 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
             datasets: [{
                 label: 'Duration (seconds)',
                 data: durData.map(d => d.duration_seconds),
-                backgroundColor: durData.map(d => d.status === 'completed' ? 'rgba(25, 135, 84, 0.7)' : 'rgba(220, 53, 69, 0.7)'),
-                borderColor: durData.map(d => d.status === 'completed' ? 'rgb(25, 135, 84)' : 'rgb(220, 53, 69)'),
+                // had_warnings arrives as "0"/"1" — compare, don't test truthiness.
+                backgroundColor: durData.map(d => d.status !== 'completed' ? 'rgba(220, 53, 69, 0.7)' : (d.had_warnings == 1 ? 'rgba(255, 193, 7, 0.7)' : 'rgba(25, 135, 84, 0.7)')),
+                borderColor: durData.map(d => d.status !== 'completed' ? 'rgb(220, 53, 69)' : (d.had_warnings == 1 ? 'rgb(255, 193, 7)' : 'rgb(25, 135, 84)')),
                 borderWidth: 1,
                 borderRadius: 3,
             }]
@@ -4389,9 +4397,12 @@ const csrfToken = '<?= $this->csrfToken() ?>';
                 // Last backup icon color
                 const lbIcon = document.getElementById('stat-lastbackup-icon');
                 if (lbIcon && data.last_backup_status) {
-                    const lbColor = data.last_backup_status === 'completed' ? 'success' : 'danger';
-                    lbIcon.className = 'stat-icon-sm bg-' + lbColor + ' bg-opacity-10 text-' + lbColor + ' rounded-2 p-2 me-2';
-                    lbIcon.innerHTML = '<i class="bi bi-' + (data.last_backup_status === 'completed' ? 'check-circle-fill' : 'x-circle-fill') + '"></i>';
+                    const lb = {
+                        completed: ['success', 'check-circle-fill'],
+                        warning: ['warning', 'exclamation-triangle-fill'],
+                    }[data.last_backup_status] || ['danger', 'x-circle-fill'];
+                    lbIcon.className = 'stat-icon-sm bg-' + lb[0] + ' bg-opacity-10 text-' + lb[0] + ' rounded-2 p-2 me-2';
+                    lbIcon.innerHTML = '<i class="bi bi-' + lb[1] + '"></i>';
                 }
 
                 // Status tab metrics (text only, no form replacement)

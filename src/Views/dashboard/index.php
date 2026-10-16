@@ -1473,7 +1473,9 @@ document.addEventListener('DOMContentLoaded', function () {
             }
             let html = '<div class="table-responsive"><table class="table table-hover mb-0 small recent-jobs-table"><thead><tr><th>Client</th><th>Task</th><th class="d-th-md">Plan</th><th class="d-th-md">Repo</th><th>Completed</th><th class="d-th-md">Duration</th><th class="text-center">Status</th></tr></thead><tbody>';
             jobs.forEach(j => {
-                const icon = j.status === 'completed' ? 'bi-check-circle-fill text-success'
+                // had_warnings arrives as "0"/"1" — compare, don't test truthiness.
+                const icon = (j.status === 'completed' && j.had_warnings == 1) ? 'bi-exclamation-triangle-fill text-warning'
+                    : j.status === 'completed' ? 'bi-check-circle-fill text-success'
                     : j.status === 'failed' ? 'bi-x-circle-fill text-danger'
                     : 'bi-slash-circle-fill text-secondary';
                 const taskIcon = TASK_ICONS[j.task_type] || 'bi-gear text-muted';

@@ -105,6 +105,8 @@ not, which is the point of evaluating them outside BBS:
       > on (instance, client, plan, repo) bbs_plan_overdue_seconds
 - alert: BackupNeverRan
   expr: bbs_plan_enabled == 1 unless bbs_plan_last_success_timestamp_seconds
+- alert: BackupNotClean        # 1 failed, 2 completed with warnings (e.g. a plugin failed)
+  expr: bbs_plan_last_run_status > 0
 - alert: OffsiteCopyOverdue
   expr: time() - bbs_repo_last_sync_timestamp_seconds > 86400
 - alert: SchedulerStopped

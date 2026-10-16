@@ -389,8 +389,9 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                                     <?php
                                     // Full class tokens with text-color pairings so warning/info
                                     // badges stay readable on light fills (#169).
+                                    $jobWarn = $job['status'] === 'completed' && !empty($job['had_warnings']);
                                     $statusBadge = match($job['status']) {
-                                        'completed' => 'bg-success',
+                                        'completed' => $jobWarn ? 'bg-warning text-dark' : 'bg-success',
                                         'failed'    => 'bg-danger',
                                         'running'   => 'bg-info text-dark',
                                         'sent'      => 'bg-primary',
@@ -398,7 +399,7 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                                         default     => 'bg-secondary',
                                     };
                                     ?>
-                                    <span class="badge <?= $statusBadge ?>"><?= $job['status'] ?></span>
+                                    <span class="badge <?= $statusBadge ?>"<?= $jobWarn ? ' title="' . htmlspecialchars(mb_substr($job['error_log'] ?? '', 0, 500)) . '"' : '' ?>><?= $jobWarn ? 'completed with warnings' : $job['status'] ?></span>
                                 </td>
                                 <td>
                                     <?php

@@ -212,6 +212,7 @@ class PrometheusMetrics
                    a.name AS client_name,
                    r.name AS repo_name,
                    lastj.status AS last_status,
+                   lastj.had_warnings AS last_had_warnings,
                    lastj.completed_at AS last_run_at,
                    lastj.duration_seconds AS last_run_duration_seconds,
                    lasts.completed_at AS last_success_at,
@@ -220,7 +221,7 @@ class PrometheusMetrics
             JOIN agents a ON a.id = bp.agent_id
             LEFT JOIN repositories r ON r.id = bp.repository_id
             LEFT JOIN (
-                SELECT backup_plan_id, status, completed_at, duration_seconds,
+                SELECT backup_plan_id, status, had_warnings, completed_at, duration_seconds,
                        ROW_NUMBER() OVER (PARTITION BY backup_plan_id ORDER BY completed_at DESC, id DESC) AS rn
                 FROM backup_jobs
                 WHERE task_type = 'backup' AND status IN ('completed', 'failed')
@@ -298,12 +299,16 @@ class PrometheusMetrics
             $this->maybeTimestamp('bbs_plan_last_run_timestamp_seconds', $labels($r), $r['last_run_at']);
         }
 
-        $this->help('bbs_plan_last_run_status', 'Result of that run: 0 completed, 1 failed.', 'gauge');
+        // 2 is appended rather than slotted in, so an alert already written as
+        // `== 1` keeps meaning "failed". A plugin that fails without aborting
+        // (a database dump, say) leaves the archive written but incomplete.
+        $this->help('bbs_plan_last_run_status', 'Result of that run: 0 completed, 1 failed, 2 completed with warnings.', 'gauge');
         foreach ($rows as $r) {
             if ($r['last_status'] === null) {
                 continue;
             }
-            $this->sample('bbs_plan_last_run_status', $labels($r), $r['last_status'] === 'completed' ? 0 : 1);
+            $status = $r['last_status'] !== 'completed' ? 1 : (!empty($r['last_had_warnings']) ? 2 : 0);
+            $this->sample('bbs_plan_last_run_status', $labels($r), $status);
         }
 
         $this->help('bbs_plan_last_run_duration_seconds', 'How long that run took.', 'gauge');

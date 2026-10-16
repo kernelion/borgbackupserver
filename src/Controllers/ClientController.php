@@ -409,7 +409,7 @@ class ClientController extends Controller
         $totalSize = array_sum(array_column($repositories, 'size_bytes'));
         $totalArchives = array_sum(array_column($repositories, 'archive_count'));
         $lastJob = $this->db->fetchOne("
-            SELECT status, completed_at FROM backup_jobs
+            SELECT status, had_warnings, completed_at FROM backup_jobs
             WHERE agent_id = ? AND status IN ('completed','failed')
             ORDER BY completed_at DESC LIMIT 1
         ", [$id]);
@@ -449,7 +449,7 @@ class ClientController extends Controller
 
         $durationChart = $this->db->fetchAll("
             SELECT DATE_FORMAT(completed_at, '%b %d %H:%i') as label,
-                   duration_seconds, status, task_type
+                   duration_seconds, status, had_warnings, task_type
             FROM backup_jobs
             WHERE agent_id = ? AND task_type = 'backup' AND status IN ('completed','failed') AND completed_at IS NOT NULL
             ORDER BY completed_at DESC LIMIT 30
@@ -618,7 +618,7 @@ class ClientController extends Controller
         ", [$id]);
 
         $lastJob = $this->db->fetchOne("
-            SELECT status, completed_at FROM backup_jobs
+            SELECT status, had_warnings, completed_at FROM backup_jobs
             WHERE agent_id = ? AND status IN ('completed','failed')
             ORDER BY completed_at DESC LIMIT 1
         ", [$id]);
@@ -675,6 +675,9 @@ class ClientController extends Controller
         // Format last backup
         $lastBackupLabel = $lastJob ? \BBS\Core\TimeHelper::format($lastJob['completed_at'], 'M j g:ia') : '--';
         $lastBackupStatus = $lastJob ? $lastJob['status'] : null;
+        if ($lastBackupStatus === 'completed' && !empty($lastJob['had_warnings'])) {
+            $lastBackupStatus = 'warning';
+        }
 
         $successRate = ($jobStats['total'] ?? 0) > 0
             ? round(($jobStats['completed'] / $jobStats['total']) * 100) : 0;
