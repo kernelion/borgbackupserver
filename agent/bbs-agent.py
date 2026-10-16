@@ -17,6 +17,7 @@ import re
 import shlex
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -53,7 +54,7 @@ if not hasattr(subprocess, "run"):
     subprocess.run = _subprocess_run
     subprocess.CompletedProcess = _CompletedProcess
 
-AGENT_VERSION = "2.98.7"
+AGENT_VERSION = "2.99.0"
 
 # Ed25519 public keys, hex, that may sign an update to this script and to
 # the start wrapper. Kept in step with agent/signing-key.pub. An update the
@@ -1806,7 +1807,7 @@ def _truthy(value):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
-def execute_plugins(plugins, config=None, job_id=None, task=None):
+def execute_plugins(plugins, config=None, job_id=None, task=None, streams=None):
     """Execute pre-backup plugins. Returns a LIST of per-config run records
     (dicts: slug, config_id, config_name, config, result). A plan can attach
     several configs — including two of the same engine — so results must be
@@ -1815,6 +1816,9 @@ def execute_plugins(plugins, config=None, job_id=None, task=None):
     `task` is the full task dict from the server; passed through to plugins
     that consume backup-context env vars (currently shell_hook only — see
     #250). Other plugins ignore it.
+
+    With `streams` (a DumpStreams), MySQL and PostgreSQL configs register
+    their databases to be streamed into the archive instead of dumping now.
     """
     runs = []
     for plugin in plugins:
@@ -1832,15 +1836,28 @@ def execute_plugins(plugins, config=None, job_id=None, task=None):
         if not func:
             logger.warning("Plugin {} not implemented, skipping".format(slug))
             continue
+        stream_func = None
+        if streams is not None and slug in _STREAMABLE_PLUGINS:
+            if slug == "pg_dump" and not _pg_format_streams(cfg.get("extra_options", "--no-owner --no-privileges")):
+                if config and job_id:
+                    log_to_server(config, job_id, "{} uses pg_dump's directory format, which cannot be streamed; dumping it to disk".format(
+                        plugin.get("config_name") or display))
+            else:
+                stream_func = globals().get("stream_plugin_{}".format(slug))
+        mark = len(streams.streams) if streams is not None else 0
         # shell_hook needs the task context to inject BBS_* env vars and
         # (opt-in) BORG_PASSCOMMAND. Other plugins keep the simpler
         # single-arg signature.
         try:
-            if slug == "shell_hook":
+            if stream_func is not None:
+                result = stream_func(cfg, streams)
+            elif slug == "shell_hook":
                 result = func(cfg, task)
             else:
                 result = func(cfg)
         except Exception as e:
+            if streams is not None:
+                del streams.streams[mark:]
             # A failing pre-backup plugin does not have to cost the backup.
             # Unless this config says otherwise, record the failure, tell the
             # server, and carry on: the remaining plugins still run and the
@@ -1870,6 +1887,15 @@ def execute_plugins(plugins, config=None, job_id=None, task=None):
             "result": result if isinstance(result, dict) else {},
         })
         logger.info("Plugin {} completed".format(slug))
+
+        if stream_func is not None:
+            for st in streams.streams[mark:]:
+                st["run"] = runs[-1]
+            if config and job_id:
+                names = result.get("databases", [])
+                log_to_server(config, job_id, "{}: {} database(s) ({}) to stream into the archive".format(
+                    display, len(names), ", ".join(names)))
+            continue
 
         # Send plugin summary to server log
         if config and job_id:
@@ -2062,6 +2088,342 @@ def _checked_dump_dir(path):
     return path
 
 
+_GZIP_ARGV = None
+
+
+def _gzip_argv():
+    """gzip with --rsyncable where the local gzip has it. A plain gzip stream
+    changes from the first changed byte to the end, so borg finds almost
+    nothing to deduplicate between two nights' dumps. --rsyncable resets the
+    compressor at content-defined points, which keeps most of it."""
+    global _GZIP_ARGV
+    if _GZIP_ARGV is None:
+        try:
+            r = subprocess.run(["gzip", "--rsyncable", "-c"], input=b"",
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+            _GZIP_ARGV = ["gzip", "--rsyncable"] if r.returncode == 0 else ["gzip"]
+        except (OSError, subprocess.SubprocessError):
+            _GZIP_ARGV = ["gzip"]
+    return _GZIP_ARGV
+
+
+def _dump_to_file(cmd, dump_path, compress, env=None):
+    """Run a dump command into dump_path, gzipped or not. Returns
+    (returncode, stderr text)."""
+    if not compress:
+        with open(dump_path, "wb") as f:
+            r = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, env=env)
+        return r.returncode, r.stderr.decode("utf-8", errors="replace")
+
+    dump_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    if IS_WINDOWS:
+        import gzip as gzip_mod
+        with gzip_mod.open(dump_path, "wb") as f:
+            while True:
+                chunk = dump_proc.stdout.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+        dump_proc.wait()
+    else:
+        with open(dump_path, "wb") as f:
+            gzip_proc = subprocess.Popen(_gzip_argv(), stdin=dump_proc.stdout, stdout=f, stderr=subprocess.PIPE)
+        dump_proc.stdout.close()
+        gzip_proc.wait()
+        dump_proc.wait()
+    stderr = dump_proc.stderr.read().decode("utf-8", errors="replace") if dump_proc.stderr else ""
+    return dump_proc.returncode, stderr
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Streaming database dumps into the archive
+#
+# With a plan's "Stream database dumps" option on, a MySQL or PostgreSQL
+# dump never touches the client's disk. Where the dump file would go, the
+# agent makes a named pipe, and borg runs with --read-special, which reads a
+# pipe as if it were a regular file. When borg reaches the pipe, the dump
+# starts writing into it. The archive ends up with name.sql at the same path
+# a dump to disk would have used, so restores need nothing new.
+#
+# What that costs, and what this code does about it:
+# - borg opens a pipe and waits for a writer, and the writer waits for borg.
+#   Each dump therefore starts when borg gets to it, one at a time, and runs
+#   at the speed borg can store it. A database is read for longer than with
+#   a dump to local disk.
+# - --read-special applies to the whole backup: any other pipe or device
+#   under the plan's directories would be read too, and one that never ends
+#   (a postfix fifo, /dev/zero in a chroot) hangs the backup. They are found
+#   before borg starts and excluded; the job log names them.
+# - borg cannot tell that a dump failed half way; it stores what arrived.
+#   The dump's exit status is checked afterwards, and a failed database is
+#   left out of the restore list and flags the job "completed with warnings".
+# - A pipe borg never opens (an exclude pattern matches it, or borg failed
+#   first) would leave its writer waiting forever, so the agent opens any
+#   unread pipe itself once borg is done.
+# Linux and macOS only, and not with snapshots: a pipe seen through a
+# snapshot is a different file with no writer.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_STREAMABLE_PLUGINS = ("pg_dump", "mysql_dump")
+
+
+class DumpStreams(object):
+    """The database dumps of one backup job that go to borg through pipes."""
+
+    def __init__(self, config, job_id):
+        self.config = config
+        self.job_id = job_id
+        self.streams = []
+        self._lock = threading.Lock()
+        self._done = False
+        self._held = contextlib.ExitStack()
+        self._started = False
+        self.on_disk = False  # fell back to dump files for this run
+
+    def hold(self, context_manager):
+        """Keep a context (the MySQL option file) open until finish()."""
+        return self._held.enter_context(context_manager)
+
+    def add(self, path, name, cmd, env, describe_error):
+        self.streams.append({
+            "path": path, "name": name, "cmd": cmd, "env": env, "run": None,
+            "describe_error": describe_error,
+            "opened": False, "bytes": 0, "error": None, "thread": None, "proc": None,
+        })
+
+    def paths(self):
+        return [s["path"] for s in self.streams]
+
+    def dump_to_disk(self, reason):
+        """Fall back to plain dump files when streaming cannot be used for
+        this run. The files get the names the pipes would have had."""
+        log_to_server(self.config, self.job_id,
+                      "Not streaming database dumps ({}); dumping to disk instead".format(reason))
+        for s in self.streams:
+            if os.path.lexists(s["path"]):
+                os.remove(s["path"])  # a pipe from start(); writing to it would block
+            rc, stderr = _dump_to_file(s["cmd"], s["path"], False, env=s["env"])
+            if rc != 0:
+                s["error"] = s["describe_error"](stderr.strip() or "exited with code {}".format(rc))
+        self.on_disk = True
+
+    def start(self):
+        """Make the pipes and start a writer for each. Each writer waits
+        until borg opens its pipe, then runs the dump into it."""
+        for s in self.streams:
+            if os.path.lexists(s["path"]):
+                os.remove(s["path"])
+            os.mkfifo(s["path"], 0o600)
+        for s in self.streams:
+            t = threading.Thread(target=self._feed, args=(s,), name="bbs-stream-{}".format(s["name"]))
+            t.daemon = True
+            s["thread"] = t
+            t.start()
+        self._started = True
+
+    def _feed(self, s):
+        try:
+            fd = os.open(s["path"], os.O_WRONLY)  # waits for borg
+        except OSError as e:
+            s["error"] = s["describe_error"]("could not open the pipe: {}".format(e))
+            return
+        try:
+            with self._lock:
+                s["opened"] = True
+                abandoned = self._done
+            if abandoned:
+                s["error"] = s["describe_error"](
+                    "borg did not read it (is the dump directory matched by an exclude pattern?)")
+                return
+            logger.info("Streaming database {} into the archive".format(s["name"]))
+            with tempfile.TemporaryFile() as errf:
+                proc = subprocess.Popen(s["cmd"], stdout=subprocess.PIPE, stderr=errf, env=s["env"])
+                s["proc"] = proc
+                out = proc.stdout.fileno()
+                try:
+                    while True:
+                        chunk = os.read(out, 1 << 20)
+                        if not chunk:
+                            break
+                        view = memoryview(chunk)
+                        while view:
+                            view = view[os.write(fd, view):]
+                        s["bytes"] += len(chunk)
+                except BrokenPipeError:
+                    s["error"] = s["describe_error"]("borg stopped reading before the dump finished")
+                    proc.kill()
+                proc.stdout.close()
+                proc.wait()
+                if proc.returncode != 0 and not s["error"]:
+                    errf.seek(0)
+                    stderr = errf.read().decode("utf-8", errors="replace").strip()
+                    s["error"] = s["describe_error"](stderr or "exited with code {}".format(proc.returncode))
+        except Exception as e:
+            s["error"] = s["describe_error"](str(e))
+            if s["proc"] is not None and s["proc"].poll() is None:
+                s["proc"].kill()
+        finally:
+            os.close(fd)
+
+    def finish(self):
+        """After borg has exited: release writers borg never reached, wait
+        for the rest, remove the pipes. Never raises."""
+        try:
+            if self._started:
+                with self._lock:
+                    self._done = True
+                    unread = [s for s in self.streams if not s["opened"]]
+                # Opening the read end lets a waiting writer's open() return;
+                # it sees the job is done and closes without dumping.
+                readers = []
+                for s in unread:
+                    try:
+                        readers.append(os.open(s["path"], os.O_RDONLY | os.O_NONBLOCK))
+                    except OSError:
+                        pass
+                for s in self.streams:
+                    t = s["thread"]
+                    if t is not None:
+                        t.join(timeout=60)
+                        if t.is_alive() and s["proc"] is not None and s["proc"].poll() is None:
+                            s["proc"].kill()
+                            t.join(timeout=10)
+                for r in readers:
+                    try:
+                        os.close(r)
+                    except OSError:
+                        pass
+        finally:
+            for s in self.streams:
+                try:
+                    if not self.on_disk and os.path.lexists(s["path"]):
+                        os.remove(s["path"])
+                except OSError:
+                    pass
+            try:
+                self._held.close()
+            except Exception:
+                pass
+
+    def report(self, plugin_runs):
+        """Log each database, drop failed ones from what the archive claims
+        to hold, and return failure records like execute_plugins' own."""
+        failures = []
+        for run in plugin_runs:
+            mine = [s for s in self.streams if s.get("run") is run]
+            if not mine:
+                continue
+            ok = []
+            for s in mine:
+                if s["error"]:
+                    log_to_server(self.config, self.job_id, "Database {} not backed up: {}".format(s["name"], s["error"]))
+                    failures.append({"slug": run.get("slug"), "config_name": run.get("config_name"),
+                                     "config": run.get("config"), "error": s["error"]})
+                else:
+                    ok.append(s["name"])
+                    if not self.on_disk:
+                        log_to_server(self.config, self.job_id, "Streamed database {} into the archive ({})".format(
+                            s["name"], _format_size(s["bytes"])))
+            run["result"]["databases"] = ok
+        return failures
+
+
+def _special_files(directories, excludes, keep, one_file_system):
+    """Paths under `directories` that borg --read-special would open and read:
+    pipes, device files, and symlinks to either. /dev/null (or a link to it)
+    is harmless, reads as empty, and is left alone, as are the paths in `keep`.
+
+    Pruning the walk with the plan's excludes only saves time, so only
+    patterns that certainly exclude a whole directory are used: plain paths
+    with no wildcards, as fm: (the default) or pp:. Walking more than borg
+    does finds extra paths to exclude, which is harmless; walking less could
+    miss one, so nothing else is pruned."""
+    prune = set()
+    for pattern in (excludes or "").splitlines():
+        pattern = pattern.strip()
+        if len(pattern) > 3 and pattern[2] == ":":
+            style, pattern = pattern[:2], pattern[3:]
+            if style not in ("fm", "pp"):
+                continue
+        if pattern and not any(c in pattern for c in "*?[]") and pattern.startswith("/"):
+            prune.add(os.path.normpath(pattern))
+    keep = {os.path.normpath(k) for k in keep}
+    try:
+        null_rdev = os.stat("/dev/null").st_rdev
+    except OSError:
+        null_rdev = None
+
+    def harmful(st):
+        mode = st.st_mode
+        if stat.S_ISCHR(mode) and st.st_rdev == null_rdev:
+            return False
+        return stat.S_ISFIFO(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode)
+
+    found = []
+    for root in [d.strip() for d in (directories or "").splitlines() if d.strip()]:
+        root = os.path.normpath(root)
+        try:
+            root_dev = os.lstat(root).st_dev
+        except OSError:
+            continue
+        stack = [root]
+        while stack:
+            d = stack.pop()
+            try:
+                it = os.scandir(d)
+            except OSError:
+                continue
+            with it:
+                for e in it:
+                    path = e.path
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            if path in prune:
+                                continue
+                            if one_file_system and e.stat(follow_symlinks=False).st_dev != root_dev:
+                                continue
+                            stack.append(path)
+                        elif e.is_symlink():
+                            try:
+                                if harmful(os.stat(path)) and path not in keep:
+                                    found.append(path)
+                            except OSError:
+                                pass  # dangling link
+                        elif not e.is_file(follow_symlinks=False):
+                            if harmful(e.stat(follow_symlinks=False)) and path not in keep:
+                                found.append(path)
+                    except OSError:
+                        continue
+    return found
+
+
+_SPECIAL_FILES_MAX = 2000
+
+
+def _prepare_streaming(config, job_id, command, directories, streams):
+    """Make the borg command safe for --read-special, start the pipes, and
+    return the command to run. Falls back to dump files if any step fails."""
+    try:
+        t0 = time.time()
+        excludes = "\n".join(t[len("--exclude="):] for t in command if t.startswith("--exclude="))
+        specials = _special_files(directories, excludes, streams.paths(), "--one-file-system" in command)
+        logger.info("Special-file check took {:.1f}s, found {}".format(time.time() - t0, len(specials)))
+        if len(specials) > _SPECIAL_FILES_MAX:
+            raise RuntimeError("{} pipes or device files under the plan's directories; exclude them to stream".format(len(specials)))
+        at = command.index("create") + 1
+        new_command = command[:at] + ["--read-special"] + ["--exclude=pp:" + p for p in specials] + command[at:]
+        if specials:
+            shown = ", ".join(specials[:10]) + (" and {} more".format(len(specials) - 10) if len(specials) > 10 else "")
+            log_to_server(config, job_id,
+                          "Left {} pipe/device file(s) out of this archive so borg does not read from them: {}".format(len(specials), shown))
+        streams.start()
+        return new_command
+    except Exception as e:
+        logger.error("Job #{}: streaming not possible: {}".format(job_id, e))
+        streams.dump_to_disk(str(e))
+        return command
+
+
 @contextlib.contextmanager
 def _mysql_login(password):
     """Pass the MySQL password in a private option file instead of on the
@@ -2106,7 +2468,11 @@ def execute_plugin_mysql_dump(config):
         return _execute_plugin_mysql_dump(config, login)
 
 
-def _execute_plugin_mysql_dump(config, login):
+def _mysql_dump_jobs(config, login):
+    """What a MySQL dump of this config runs, without running it:
+    (dump_dir, per_database, [(name, argv)]). Shared by the dump-to-disk and
+    the streaming paths. `login` is the --defaults-file argument from
+    _mysql_login(); it must stay valid until the commands have run."""
     dump_dir = _checked_dump_dir(config.get("dump_dir", "/home/bbs/mysql"))
     os.makedirs(dump_dir, exist_ok=True)
 
@@ -2116,7 +2482,6 @@ def _execute_plugin_mysql_dump(config, login):
     password = config.get("password")
     databases = config.get("databases", "*")
     per_database = config.get("per_database", True)
-    compress = config.get("compress", True)
     exclude = config.get("exclude_databases", ["information_schema", "performance_schema", "sys"])
     extra_options = config.get("extra_options", "--single-transaction --quick --routines --triggers --events")
 
@@ -2150,74 +2515,33 @@ def _execute_plugin_mysql_dump(config, login):
     if extra_options:
         base_cmd.extend(_checked_extra_options("mysqldump", extra_options))
 
-    dump_files = []
-
     if per_database:
-        for db in databases:
-            filename = "{}.sql.gz".format(db) if compress else "{}.sql".format(db)
-            dump_path = os.path.join(dump_dir, filename)
-            logger.info("Dumping database {} to {}".format(db, dump_path))
-
-            cmd = base_cmd + ["--", db]
-            if compress:
-                dump_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if IS_WINDOWS:
-                    import gzip as gzip_mod
-                    with gzip_mod.open(dump_path, "wb") as f:
-                        while True:
-                            chunk = dump_proc.stdout.read(65536)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-                    dump_proc.wait()
-                else:
-                    with open(dump_path, "wb") as f:
-                        gzip_proc = subprocess.Popen(["gzip"], stdin=dump_proc.stdout, stdout=f, stderr=subprocess.PIPE)
-                    dump_proc.stdout.close()
-                    gzip_proc.wait()
-                    dump_proc.wait()
-                if dump_proc.returncode != 0:
-                    stderr = dump_proc.stderr.read().decode() if dump_proc.stderr else ""
-                    raise Exception("mysqldump failed for {}: {}".format(db, stderr))
-            else:
-                with open(dump_path, "w") as f:
-                    r = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
-                    if r.returncode != 0:
-                        raise Exception("mysqldump failed for {}: {}".format(db, r.stderr.decode('utf-8', errors='replace')))
-
-            dump_files.append(dump_path)
+        jobs = [(db, base_cmd + ["--", db]) for db in databases]
     else:
-        filename = "all_databases.sql.gz" if compress else "all_databases.sql"
+        jobs = [("all_databases", base_cmd + ["--all-databases"])]
+    return dump_dir, per_database, jobs
+
+
+def _mysql_dump_error(name, stderr):
+    if name == "all_databases":
+        return "mysqldump failed: {}".format(stderr)
+    return "mysqldump failed for {}: {}".format(name, stderr)
+
+
+def _execute_plugin_mysql_dump(config, login):
+    dump_dir, per_database, jobs = _mysql_dump_jobs(config, login)
+    compress = config.get("compress", True)
+    dump_files = []
+    for name, cmd in jobs:
+        filename = "{}.sql.gz".format(name) if compress else "{}.sql".format(name)
         dump_path = os.path.join(dump_dir, filename)
-        logger.info("Dumping all databases to {}".format(dump_path))
-
-        cmd = base_cmd + ["--all-databases"]
-        if compress:
-            dump_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if IS_WINDOWS:
-                import gzip as gzip_mod
-                with gzip_mod.open(dump_path, "wb") as f:
-                    while True:
-                        chunk = dump_proc.stdout.read(65536)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                dump_proc.wait()
-            else:
-                with open(dump_path, "wb") as f:
-                    gzip_proc = subprocess.Popen(["gzip"], stdin=dump_proc.stdout, stdout=f, stderr=subprocess.PIPE)
-                dump_proc.stdout.close()
-                gzip_proc.wait()
-                dump_proc.wait()
-            if dump_proc.returncode != 0:
-                stderr = dump_proc.stderr.read().decode() if dump_proc.stderr else ""
-                raise Exception("mysqldump failed: {}".format(stderr))
+        if per_database:
+            logger.info("Dumping database {} to {}".format(name, dump_path))
         else:
-            with open(dump_path, "w") as f:
-                r = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
-                if r.returncode != 0:
-                    raise Exception("mysqldump failed: {}".format(r.stderr.decode('utf-8', errors='replace')))
-
+            logger.info("Dumping all databases to {}".format(dump_path))
+        rc, stderr = _dump_to_file(cmd, dump_path, compress)
+        if rc != 0:
+            raise Exception(_mysql_dump_error(name, stderr))
         dump_files.append(dump_path)
 
     logger.info("MySQL dump complete: {} file(s) in {}".format(len(dump_files), dump_dir))
@@ -2230,6 +2554,23 @@ def _execute_plugin_mysql_dump(config, login):
         "compress": compress,
     }
 
+
+def stream_plugin_mysql_dump(config, streams):
+    """Register this config's databases to be streamed into the archive. The
+    option file holding the password lives until the streams are done."""
+    login = streams.hold(_mysql_login(config.get("password")))
+    dump_dir, per_database, jobs = _mysql_dump_jobs(config, login)
+    for name, cmd in jobs:
+        streams.add(os.path.join(dump_dir, "{}.sql".format(name)), name, cmd, None,
+                    lambda stderr, name=name: _mysql_dump_error(name, stderr))
+    return {
+        "dump_files": [],
+        "dump_dir": dump_dir,
+        "databases": [name for name, _ in jobs],
+        "per_database": per_database,
+        "compress": False,
+        "streamed": True,
+    }
 
 def cleanup_plugin_mysql_dump(config, plugin_result):
     """Delete dump files after backup if cleanup_after is enabled."""
@@ -2306,8 +2647,10 @@ def _pg_dump_for_server(host, port, user, pg_env):
                      "(install postgresql-client-{} if the versions do not match)").format(major, default, major)
 
 
-def execute_plugin_pg_dump(config):
-    """Dump PostgreSQL databases before backup."""
+def _pg_dump_jobs(config):
+    """What a PostgreSQL dump of this config runs, without running it:
+    (dump_dir, env, [(database, argv)]). Shared by the dump-to-disk and the
+    streaming paths so both dump the same databases the same way."""
     dump_dir = _checked_dump_dir(config.get("dump_dir", "/home/bbs/pgdump"))
     os.makedirs(dump_dir, exist_ok=True)
 
@@ -2316,7 +2659,6 @@ def execute_plugin_pg_dump(config):
     user = config.get("user")
     password = config.get("password")
     databases = config.get("databases", "*")
-    compress = config.get("compress", True)
     exclude = config.get("exclude_databases", ["template0", "template1", "postgres"])
     extra_options = config.get("extra_options", "--no-owner --no-privileges")
 
@@ -2350,48 +2692,37 @@ def execute_plugin_pg_dump(config):
         databases = [d.strip() for d in databases.split(",") if d.strip()]
 
     databases = [_checked_db_name(db) for db in databases]
-    dump_files = []
     pg_dump_bin, pg_note = _pg_dump_for_server(host, port, user, pg_env)
     logger.info("PostgreSQL plugin: {}".format(pg_note))
 
+    jobs = []
     for db in databases:
-        filename = "{}.sql.gz".format(db) if compress else "{}.sql".format(db)
-        dump_path = os.path.join(dump_dir, filename)
-        logger.info("Dumping PostgreSQL database {} to {}".format(db, dump_path))
-
         cmd = [pg_dump_bin, "-h", host, "-p", port, "-U", user]
         if extra_options:
             cmd.extend(_checked_extra_options("pg_dump", extra_options))
         cmd.extend(["--", db])
+        jobs.append((db, cmd))
+    return dump_dir, pg_env, jobs
 
-        if compress:
-            dump_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=pg_env)
-            if IS_WINDOWS:
-                import gzip as gzip_mod
-                with gzip_mod.open(dump_path, "wb") as f:
-                    while True:
-                        chunk = dump_proc.stdout.read(65536)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                dump_proc.wait()
-            else:
-                with open(dump_path, "wb") as f:
-                    gzip_proc = subprocess.Popen(["gzip"], stdin=dump_proc.stdout, stdout=f, stderr=subprocess.PIPE)
-                dump_proc.stdout.close()
-                gzip_proc.wait()
-                dump_proc.wait()
-            if dump_proc.returncode != 0:
-                stderr = dump_proc.stderr.read().decode() if dump_proc.stderr else ""
-                if "server version mismatch" in stderr:
-                    stderr += " Install the PostgreSQL client that matches the server (Debian/Ubuntu: postgresql-client-<major> from the PostgreSQL apt repository); the agent picks the matching pg_dump when it is present."
-                raise Exception("pg_dump failed for {}: {}".format(db, stderr))
-        else:
-            with open(dump_path, "w") as f:
-                r = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, env=pg_env)
-                if r.returncode != 0:
-                    raise Exception("pg_dump failed for {}: {}".format(db, r.stderr.decode('utf-8', errors='replace')))
 
+def _pg_dump_error(db, stderr):
+    if "server version mismatch" in stderr:
+        stderr += " Install the PostgreSQL client that matches the server (Debian/Ubuntu: postgresql-client-<major> from the PostgreSQL apt repository); the agent picks the matching pg_dump when it is present."
+    return "pg_dump failed for {}: {}".format(db, stderr)
+
+
+def execute_plugin_pg_dump(config):
+    """Dump PostgreSQL databases before backup."""
+    dump_dir, pg_env, jobs = _pg_dump_jobs(config)
+    compress = config.get("compress", True)
+    dump_files = []
+    for db, cmd in jobs:
+        filename = "{}.sql.gz".format(db) if compress else "{}.sql".format(db)
+        dump_path = os.path.join(dump_dir, filename)
+        logger.info("Dumping PostgreSQL database {} to {}".format(db, dump_path))
+        rc, stderr = _dump_to_file(cmd, dump_path, compress, env=pg_env)
+        if rc != 0:
+            raise Exception(_pg_dump_error(db, stderr))
         dump_files.append(dump_path)
 
     logger.info("PostgreSQL dump complete: {} file(s) in {}".format(len(dump_files), dump_dir))
@@ -2404,6 +2735,41 @@ def execute_plugin_pg_dump(config):
         "compress": compress,
     }
 
+
+def _pg_format_streams(extra_options):
+    """pg_dump's directory format writes many files, so it cannot go down a
+    pipe. Plain, custom and tar all go to stdout."""
+    try:
+        opts = shlex.split(extra_options or "")
+    except ValueError:
+        return True
+    for i, opt in enumerate(opts):
+        value = None
+        if opt.startswith("--format="):
+            value = opt.split("=", 1)[1]
+        elif opt in ("-F", "--format") and i + 1 < len(opts):
+            value = opts[i + 1]
+        elif opt.startswith("-F") and len(opt) > 2:
+            value = opt[2:]
+        if value is not None and value.lower() in ("d", "directory"):
+            return False
+    return True
+
+
+def stream_plugin_pg_dump(config, streams):
+    """Register this config's databases to be streamed into the archive."""
+    dump_dir, pg_env, jobs = _pg_dump_jobs(config)
+    for db, cmd in jobs:
+        streams.add(os.path.join(dump_dir, "{}.sql".format(db)), db, cmd, pg_env,
+                    lambda stderr, db=db: _pg_dump_error(db, stderr))
+    return {
+        "dump_files": [],
+        "dump_dir": dump_dir,
+        "databases": [db for db, _ in jobs],
+        "per_database": True,
+        "compress": False,
+        "streamed": True,
+    }
 
 def cleanup_plugin_pg_dump(config, plugin_result):
     """Delete PostgreSQL dump files after backup if cleanup_after is enabled."""
@@ -4776,15 +5142,28 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
         "status_message": "Starting task...",
     })
 
+    # Database dumps streamed into the archive instead of written to disk
+    # first, when the plan asks for it and this run can (see DumpStreams).
+    streams = None
+    if task_type == "backup" and plugins and task.get("stream_db_dumps"):
+        if IS_WINDOWS:
+            log_to_server(config, job_id, "Streaming database dumps is not available on Windows; dumping to disk")
+        elif task.get("snapshot"):
+            log_to_server(config, job_id, "Streaming database dumps does not work with snapshots; dumping to disk")
+        else:
+            streams = DumpStreams(config, job_id)
+
     # Execute pre-backup plugins
     plugin_runs = []
     if task_type == "backup" and plugins:
         try:
             logger.info("Running {} pre-backup plugin(s)".format(len(plugins)))
-            plugin_runs = execute_plugins(plugins, config, job_id, task=task)
+            plugin_runs = execute_plugins(plugins, config, job_id, task=task, streams=streams)
         except Exception as e:
             # Only reached when a plugin config has abort_on_failure set —
             # otherwise execute_plugins() records the failure and continues.
+            if streams is not None:
+                streams.finish()
             logger.error("Pre-backup plugin failed: {}".format(e))
             report_status(config, {
                 "job_id": job_id,
@@ -4981,6 +5360,8 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             logger.info("Wrote temporary SSH key for remote repo")
         except Exception as e:
             logger.error("Failed to write remote SSH key: {}".format(e))
+            if streams is not None:
+                streams.finish()
             report_status(config, {
                 "job_id": job_id, "result": "failed",
                 "error_log": "Failed to write remote SSH key: {}".format(e),
@@ -5003,6 +5384,9 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             })
             return
         logger.info("Executing {} job #{} from snapshot tree {}: {}".format(task_type, job_id, cwd, ' '.join(command)))
+
+    if streams is not None and streams.streams:
+        command = _prepare_streaming(config, job_id, command, directories, streams)
 
     try:
         # borg's stdout goes to a FILE, not a pipe.
@@ -5409,6 +5793,9 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
     finally:
         current_borg_proc = None
 
+        if streams is not None:
+            streams.finish()
+
         if snapshot_session is not None:
             snapshot_session.cleanup()
 
@@ -5513,6 +5900,8 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
         status_data["archive_name"] = archive_name
     if error_output:
         status_data["error_log"] = error_output[:10000]  # Limit size
+    if streams is not None and streams.streams and result == "completed":
+        plugin_failures = plugin_failures + streams.report(plugin_runs)
     if plugin_failures:
         had_warnings = True
         summary = "; ".join(
@@ -5536,6 +5925,8 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             if run.get("error"):
                 continue  # failed dump — nothing was written, don't claim a group
             r = run.get("result", {}) or {}
+            if not r.get("databases"):
+                continue  # every streamed database failed
             db_groups.append({
                 "config_id": run.get("config_id"),
                 "config_name": run.get("config_name"),
@@ -5792,4 +6183,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-# bbs-signature: v1 pw51q2UNJcDs0q8HCD6kewVB2typH7Ha2m1bslRio6XGk7rfKLduOE0yrLz2/PlkE5VuE4saTu7OxTccIRTTDA==
+# bbs-signature: v1 U3sMQUfYXPMt9ywkTcRGF+3L81vUKO/fP/3xJ6Zkm9BM0NeQhsNEiTiFdg/gM/ZPOcpWugIjt2Msts1SdAy8Bw==
