@@ -1751,6 +1751,26 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
 
     // Render the horizontal list of plugin-config cards with a checkbox each.
     // $checkedIds = config ids currently attached to the plan.
+    // "Stream database dumps" sits under the cards and shows only while a
+    // MySQL or PostgreSQL config is ticked; it means nothing for the others.
+    // Windows agents cannot stream, so it is not offered there.
+    $renderStreamOption = function (?array $plan) use ($agent) {
+        if (stripos($agent['os_info'] ?? '', 'Windows') !== false) {
+            return;
+        }
+        $id = 'streamDb' . ($plan ? (int) $plan['id'] : 'New');
+        ?>
+        <div class="ppc-stream mt-2" style="display:none;">
+            <?php if ($plan): ?><input type="hidden" name="stream_db_dumps_present" value="1"><?php endif; ?>
+            <div class="form-check">
+                <input class="form-check-input" type="checkbox" name="stream_db_dumps" id="<?= $id ?>" value="1" <?= !empty($plan['stream_db_dumps']) ? 'checked' : '' ?>>
+                <label class="form-check-label" for="<?= $id ?>">Stream database dumps into the archive</label>
+            </div>
+            <div class="form-text">MySQL and PostgreSQL dumps go straight to borg instead of to this client's disk first, so a dump larger than the free space still works. Each database is read for as long as borg takes to store it, which is usually longer than a dump to local disk. Not used with snapshots.</div>
+        </div>
+        <?php
+    };
+
     $renderPluginCards = function (array $checkedIds) use ($planPluginConfigCards) {
         $typeLabels = [
             'mysql_dump' => 'MySQL', 'pg_dump' => 'PostgreSQL', 'mongo_dump' => 'MongoDB',
@@ -1786,7 +1806,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
             $type = $typeLabels[$slug] ?? ucfirst(str_replace('_', ' ', $slug));
             ?>
             <label class="border rounded p-2 position-relative d-flex align-items-center gap-2 ppc-card <?= $checked ? 'border-primary bg-primary-subtle' : '' ?>" style="width:190px;cursor:pointer;" for="<?= $cid ?>" draggable="true">
-                <input class="form-check-input position-absolute" type="checkbox" name="plan_plugin_configs[]" value="<?= (int) $c['id'] ?>" id="<?= $cid ?>" <?= $checked ? 'checked' : '' ?> style="top:6px;right:6px;margin:0;">
+                <input class="form-check-input position-absolute" type="checkbox" name="plan_plugin_configs[]" value="<?= (int) $c['id'] ?>" data-slug="<?= htmlspecialchars($slug) ?>" id="<?= $cid ?>" <?= $checked ? 'checked' : '' ?> style="top:6px;right:6px;margin:0;">
                 <span class="ppc-step badge rounded-pill bg-primary position-absolute" style="top:-7px;left:-7px;font-size:0.65rem;display:none;">1</span>
                 <i class="bi bi-grip-vertical text-muted" style="cursor:grab;font-size:0.9rem;" title="Drag to change the order they run in"></i>
                 <?= $iconHtml ?>
@@ -1835,6 +1855,13 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
             return best;
         }
 
+        function syncStream(list) {
+            var box = list.parentNode.querySelector('.ppc-stream');
+            if (!box) return;
+            var db = list.querySelector('input[data-slug="mysql_dump"]:checked, input[data-slug="pg_dump"]:checked');
+            box.style.display = db ? '' : 'none';
+        }
+
         function wire(list) {
             if (list.dataset.ppcWired) return;
             list.dataset.ppcWired = '1';
@@ -1877,9 +1904,11 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                     card.classList.toggle('bg-primary-subtle', e.target.checked);
                 }
                 renumber(list);
+                syncStream(list);
             });
 
             renumber(list);
+            syncStream(list);
         }
 
         function wireAll() { document.querySelectorAll('.ppc-sortable').forEach(wire); }
@@ -2294,12 +2323,6 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                         <input class="form-check-input" type="checkbox" name="snapshot" id="editOptSnapshot<?= $plan['id'] ?>" value="1" <?= !empty($plan['snapshot']) ? 'checked' : '' ?> <?= $snapCapable || !empty($plan['snapshot']) ? '' : 'disabled' ?>>
                                         <label class="form-check-label" for="editOptSnapshot<?= $plan['id'] ?>">Back up from a snapshot <i class="bi bi-info-circle text-muted small"></i></label>
                                     </div>
-                                    <?php $streamOk = stripos($agent['os_info'] ?? '', 'Windows') === false; ?>
-                                    <input type="hidden" name="stream_db_dumps_present" value="1">
-                                    <div class="form-check" title="<?= $streamOk ? 'MySQL and PostgreSQL dumps go straight to borg instead of to this client&#39;s disk first, so a dump bigger than the free space still works. Each database is read for as long as borg takes to store it, which is usually longer than a dump to local disk. Linux and macOS; not used with snapshots.' : 'Not available on Windows clients.' ?>">
-                                        <input class="form-check-input" type="checkbox" name="stream_db_dumps" id="editOptStream<?= $plan['id'] ?>" value="1" <?= !empty($plan['stream_db_dumps']) ? 'checked' : '' ?> <?= $streamOk || !empty($plan['stream_db_dumps']) ? '' : 'disabled' ?>>
-                                        <label class="form-check-label" for="editOptStream<?= $plan['id'] ?>">Stream database dumps into the archive <i class="bi bi-info-circle text-muted small"></i></label>
-                                    </div>
                                     <div class="d-flex align-items-center gap-2 mt-2" title="How much CPU and disk the backup may take from other work on the client. Low runs borg with nice 10 and best-effort I/O; Idle runs it only when nothing else wants the CPU or disk. Linux and macOS; Windows ignores it.">
                                         <label class="form-label mb-0 small" for="editOptPriority<?= $plan['id'] ?>">Priority</label>
                                         <select class="form-select form-select-sm w-auto" name="priority" id="editOptPriority<?= $plan['id'] ?>">
@@ -2363,6 +2386,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                         <div class="col-md-9">
                             <div class="form-text mb-2">Run these before each backup &mdash; check any number, including two of the same engine. They run left to right; drag a card to change the order.</div>
                             <?php $renderPluginCards($checkedIds); ?>
+                            <?php $renderStreamOption($plan); ?>
                             <small class="text-muted d-block mt-2"><a href="?tab=plugins">Manage plugin configurations</a></small>
                         </div>
                     </div>
@@ -2662,11 +2686,6 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                     <input class="form-check-input" type="checkbox" name="snapshot" id="optSnapshot" value="1" <?= $snapCapable ? '' : 'disabled' ?>>
                                     <label class="form-check-label" for="optSnapshot">Back up from a snapshot <i class="bi bi-info-circle text-muted small"></i></label>
                                 </div>
-                                <?php $streamOk = stripos($agent['os_info'] ?? '', 'Windows') === false; ?>
-                                <div class="form-check" title="<?= $streamOk ? 'MySQL and PostgreSQL dumps go straight to borg instead of to this client&#39;s disk first, so a dump bigger than the free space still works. Each database is read for as long as borg takes to store it, which is usually longer than a dump to local disk. Linux and macOS; not used with snapshots.' : 'Not available on Windows clients.' ?>">
-                                    <input class="form-check-input" type="checkbox" name="stream_db_dumps" id="optStream" value="1" <?= $streamOk ? '' : 'disabled' ?>>
-                                    <label class="form-check-label" for="optStream">Stream database dumps into the archive <i class="bi bi-info-circle text-muted small"></i></label>
-                                </div>
                                 <div class="d-flex align-items-center gap-2 mt-2" title="How much CPU and disk the backup may take from other work on the client. Low runs borg with nice 10 and best-effort I/O; Idle runs it only when nothing else wants the CPU or disk. Linux and macOS; Windows ignores it.">
                                     <label class="form-label mb-0 small" for="optPriority">Priority</label>
                                     <select class="form-select form-select-sm w-auto" name="priority" id="optPriority">
@@ -2736,6 +2755,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                     <div class="col-md-9">
                         <div class="form-text mb-2">Run these before each backup &mdash; check any number, including two of the same engine. They run left to right; drag a card to change the order.</div>
                         <?php $renderPluginCards([]); ?>
+                        <?php $renderStreamOption(null); ?>
                         <small class="text-muted d-block mt-2"><a href="?tab=plugins">Manage plugin configurations</a></small>
                     </div>
                 </div>
@@ -3407,7 +3427,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                     </div>
                                     <div class="mb-2"><label class="form-label small fw-semibold mb-1">Dump Directory</label><input type="text" class="form-control form-control-sm" name="plugin_config[dump_dir]" value="<?= $plugin['slug'] === 'pg_dump' ? '/home/bbs/pgdump' : '/home/bbs/mysql' ?>"></div>
                                     <div class="row g-2 mb-2">
-                                        <div class="col-auto"><div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[compress]" value="1" id="newCfg<?= $plugin['id'] ?>_compress" checked><label class="form-check-label small" for="newCfg<?= $plugin['id'] ?>_compress">Compress</label></div></div>
+                                        <div class="col-auto"><div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[compress]" value="1" id="newCfg<?= $plugin['id'] ?>_compress"><label class="form-check-label small" for="newCfg<?= $plugin['id'] ?>_compress" title="Off: plain dumps, which borg compresses and deduplicates against the previous night's. On: smaller on this client's disk, but the repository stores most of a gzipped dump again every night.">Compress (gzip) <i class="bi bi-info-circle text-muted small"></i></label></div></div>
                                         <div class="col-auto"><div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[cleanup_after]" value="1" id="newCfg<?= $plugin['id'] ?>_cleanup" checked><label class="form-check-label small" for="newCfg<?= $plugin['id'] ?>_cleanup">Cleanup after backup</label></div></div>
                                         <div class="col"><label class="form-label small fw-semibold mb-1">Extra Options</label><input type="text" class="form-control form-control-sm" name="plugin_config[extra_options]" value="<?= $plugin['slug'] === 'pg_dump' ? '--no-owner --no-privileges' : '--single-transaction --quick --routines --triggers --events' ?>"></div>
                                     </div>
