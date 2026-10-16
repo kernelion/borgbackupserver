@@ -431,7 +431,7 @@ class AdminApiController extends Controller
         unset($rr);
         $plans = $this->db->fetchAll(
             "SELECT bp.id, bp.name, bp.directories, bp.excludes, bp.advanced_options, bp.enabled,
-                    bp.snapshot, bp.priority, bp.repository_id,
+                    bp.snapshot, bp.stream_db_dumps, bp.priority, bp.repository_id,
                     bp.prune_minutes, bp.prune_hours, bp.prune_days,
                     bp.prune_weeks, bp.prune_months, bp.prune_years,
                     s.frequency, s.times, s.day_of_week, s.day_of_month,
@@ -444,6 +444,7 @@ class AdminApiController extends Controller
             $p['id'] = (int) $p['id'];
             $p['enabled'] = (bool) $p['enabled'];
             $p['snapshot'] = (bool) ($p['snapshot'] ?? 0);
+            $p['stream_db_dumps'] = (bool) ($p['stream_db_dumps'] ?? 0);
             $p['priority'] = $p['priority'] ?? 'normal';
             $p['days_of_week'] = \BBS\Services\SchedulerService::parseDaysOfWeek($p['day_of_week'] ?? '');
             $p['day_of_week'] = $p['days_of_week'][0] ?? null;
@@ -907,7 +908,7 @@ class AdminApiController extends Controller
         // only noticed later, when archives start disappearing.
         $plans = $this->db->fetchAll("
             SELECT bp.id, bp.name, bp.directories, bp.excludes, bp.advanced_options,
-                   bp.enabled, bp.snapshot, bp.priority, bp.repository_id, r.name as repository_name,
+                   bp.enabled, bp.snapshot, bp.stream_db_dumps, bp.priority, bp.repository_id, r.name as repository_name,
                    bp.prune_minutes, bp.prune_hours, bp.prune_days,
                    bp.prune_weeks, bp.prune_months, bp.prune_years,
                    s.frequency, s.times, s.day_of_week, s.day_of_month,
@@ -951,6 +952,7 @@ class AdminApiController extends Controller
             $p['id'] = (int) $p['id'];
             $p['enabled'] = (bool) $p['enabled'];
             $p['snapshot'] = (bool) ($p['snapshot'] ?? 0);
+            $p['stream_db_dumps'] = (bool) ($p['stream_db_dumps'] ?? 0);
             $p['priority'] = $p['priority'] ?? 'normal';
             $p['days_of_week'] = \BBS\Services\SchedulerService::parseDaysOfWeek($p['day_of_week'] ?? '');
             $p['day_of_week'] = $p['days_of_week'][0] ?? null;
@@ -1044,6 +1046,7 @@ class AdminApiController extends Controller
             'excludes' => $excludes ?: null,
             'advanced_options' => $advancedOptions,
             'snapshot' => !empty($input['snapshot']) ? 1 : 0,
+            'stream_db_dumps' => !empty($input['stream_db_dumps']) ? 1 : 0,
             'priority' => $priority,
             'prune_minutes' => $pruneMinutes,
             'prune_hours' => $pruneHours,
@@ -1819,6 +1822,9 @@ class AdminApiController extends Controller
                 $this->json(['error' => 'priority must be one of: ' . implode(', ', self::VALID_PRIORITIES)], 422);
             }
             $planData['priority'] = $input['priority'];
+        }
+        if (array_key_exists('stream_db_dumps', $input)) {
+            $planData['stream_db_dumps'] = !empty($input['stream_db_dumps']) ? 1 : 0;
         }
         if (array_key_exists('snapshot', $input)) {
             $planData['snapshot'] = !empty($input['snapshot']) ? 1 : 0;

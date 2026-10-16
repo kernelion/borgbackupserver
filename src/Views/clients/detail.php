@@ -2294,6 +2294,12 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                         <input class="form-check-input" type="checkbox" name="snapshot" id="editOptSnapshot<?= $plan['id'] ?>" value="1" <?= !empty($plan['snapshot']) ? 'checked' : '' ?> <?= $snapCapable || !empty($plan['snapshot']) ? '' : 'disabled' ?>>
                                         <label class="form-check-label" for="editOptSnapshot<?= $plan['id'] ?>">Back up from a snapshot <i class="bi bi-info-circle text-muted small"></i></label>
                                     </div>
+                                    <?php $streamOk = stripos($agent['os_info'] ?? '', 'Windows') === false; ?>
+                                    <input type="hidden" name="stream_db_dumps_present" value="1">
+                                    <div class="form-check" title="<?= $streamOk ? 'MySQL and PostgreSQL dumps go straight to borg instead of to this client&#39;s disk first, so a dump bigger than the free space still works. Each database is read for as long as borg takes to store it, which is usually longer than a dump to local disk. Linux and macOS; not used with snapshots.' : 'Not available on Windows clients.' ?>">
+                                        <input class="form-check-input" type="checkbox" name="stream_db_dumps" id="editOptStream<?= $plan['id'] ?>" value="1" <?= !empty($plan['stream_db_dumps']) ? 'checked' : '' ?> <?= $streamOk || !empty($plan['stream_db_dumps']) ? '' : 'disabled' ?>>
+                                        <label class="form-check-label" for="editOptStream<?= $plan['id'] ?>">Stream database dumps into the archive <i class="bi bi-info-circle text-muted small"></i></label>
+                                    </div>
                                     <div class="d-flex align-items-center gap-2 mt-2" title="How much CPU and disk the backup may take from other work on the client. Low runs borg with nice 10 and best-effort I/O; Idle runs it only when nothing else wants the CPU or disk. Linux and macOS; Windows ignores it.">
                                         <label class="form-label mb-0 small" for="editOptPriority<?= $plan['id'] ?>">Priority</label>
                                         <select class="form-select form-select-sm w-auto" name="priority" id="editOptPriority<?= $plan['id'] ?>">
@@ -2655,6 +2661,11 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                 <div class="form-check" title="<?= $snapCapable ? 'The agent takes a snapshot of each source volume (' . htmlspecialchars($snapMethods) . '), backs up from it, then removes it. Volumes it cannot snapshot are backed up live.' : 'Not available on this client: ' . htmlspecialchars($snapReason) ?>">
                                     <input class="form-check-input" type="checkbox" name="snapshot" id="optSnapshot" value="1" <?= $snapCapable ? '' : 'disabled' ?>>
                                     <label class="form-check-label" for="optSnapshot">Back up from a snapshot <i class="bi bi-info-circle text-muted small"></i></label>
+                                </div>
+                                <?php $streamOk = stripos($agent['os_info'] ?? '', 'Windows') === false; ?>
+                                <div class="form-check" title="<?= $streamOk ? 'MySQL and PostgreSQL dumps go straight to borg instead of to this client&#39;s disk first, so a dump bigger than the free space still works. Each database is read for as long as borg takes to store it, which is usually longer than a dump to local disk. Linux and macOS; not used with snapshots.' : 'Not available on Windows clients.' ?>">
+                                    <input class="form-check-input" type="checkbox" name="stream_db_dumps" id="optStream" value="1" <?= $streamOk ? '' : 'disabled' ?>>
+                                    <label class="form-check-label" for="optStream">Stream database dumps into the archive <i class="bi bi-info-circle text-muted small"></i></label>
                                 </div>
                                 <div class="d-flex align-items-center gap-2 mt-2" title="How much CPU and disk the backup may take from other work on the client. Low runs borg with nice 10 and best-effort I/O; Idle runs it only when nothing else wants the CPU or disk. Linux and macOS; Windows ignores it.">
                                     <label class="form-label mb-0 small" for="optPriority">Priority</label>

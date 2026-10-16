@@ -68,6 +68,7 @@ class BackupPlanController extends Controller
             'excludes' => $excludes ?: null,
             'advanced_options' => $advancedOptions ?: null,
             'snapshot' => !empty($_POST['snapshot']) ? 1 : 0,
+            'stream_db_dumps' => !empty($_POST['stream_db_dumps']) ? 1 : 0,
             'priority' => in_array($_POST['priority'] ?? 'normal', ['normal', 'low', 'idle'], true) ? $_POST['priority'] : 'normal',
             'prune_minutes' => $pruneMinutes,
             'prune_hours' => $pruneHours,
@@ -131,6 +132,7 @@ class BackupPlanController extends Controller
         // An unticked checkbox is absent from the POST; the form carries a
         // marker so "absent" can be told from "not on this form".
         if (isset($_POST['snapshot_present'])) $data['snapshot'] = !empty($_POST['snapshot']) ? 1 : 0;
+        if (isset($_POST['stream_db_dumps_present'])) $data['stream_db_dumps'] = !empty($_POST['stream_db_dumps']) ? 1 : 0;
         if (isset($_POST['priority']) && in_array($_POST['priority'], ['normal', 'low', 'idle'], true)) $data['priority'] = $_POST['priority'];
         if (isset($_POST['advanced_options']) || isset($_POST['directories'])) {
             $fieldError = \BBS\Services\BorgCommandBuilder::validatePlanFields(
@@ -341,6 +343,7 @@ class BackupPlanController extends Controller
             'excludes' => $plan['excludes'],
             'advanced_options' => $plan['advanced_options'],
             'snapshot' => $plan['snapshot'] ?? 0,
+            'stream_db_dumps' => $plan['stream_db_dumps'] ?? 0,
             'priority' => $plan['priority'] ?? 'normal',
             'prune_minutes' => $plan['prune_minutes'],
             'prune_hours' => $plan['prune_hours'],

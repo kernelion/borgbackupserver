@@ -593,7 +593,8 @@ class PluginManager
                 'compress' => [
                     'type' => 'checkbox',
                     'label' => 'Compress dumps (gzip)',
-                    'default' => true,
+                    'default' => false,
+                    'help' => 'Off (default): plain .sql. Borg compresses the archive anyway, and a plain dump deduplicates against last night\'s, so the repository grows by what changed. On: smaller on this client\'s disk while the backup runs, but a gzipped dump deduplicates poorly and the repository stores most of it again every night. Streamed dumps are never gzipped.',
                 ],
                 'cleanup_after' => [
                     'type' => 'checkbox',
@@ -652,7 +653,8 @@ class PluginManager
                 'compress' => [
                     'type' => 'checkbox',
                     'label' => 'Compress dumps (gzip)',
-                    'default' => true,
+                    'default' => false,
+                    'help' => 'Off (default): plain .sql. Borg compresses the archive anyway, and a plain dump deduplicates against last night\'s, so the repository grows by what changed. On: smaller on this client\'s disk while the backup runs, but a gzipped dump deduplicates poorly and the repository stores most of it again every night. Streamed dumps are never gzipped.',
                 ],
                 'cleanup_after' => [
                     'type' => 'checkbox',
@@ -718,7 +720,8 @@ class PluginManager
                 'compress' => [
                     'type' => 'checkbox',
                     'label' => 'Compress dumps (gzip)',
-                    'default' => true,
+                    'default' => false,
+                    'help' => 'Off (default): plain BSON. Borg compresses the archive anyway, and a plain dump deduplicates against last night\'s. On: smaller on this client\'s disk while the backup runs, but gzipped dumps deduplicate poorly.',
                 ],
                 'cleanup_after' => [
                     'type' => 'checkbox',
@@ -970,7 +973,7 @@ class PluginManager
             'type' => 'checkbox',
             'label' => 'Abort the backup if this plugin fails',
             'default' => false,
-            'help' => 'Off (default): if this plugin fails, the failure is logged, the backup still runs, and the job is marked "completed with warnings". On: the plugin failing stops the backup entirely — use it when an archive without this plugin\'s output would be worthless.',
+            'help' => 'Off (default): if this plugin fails, the failure is logged, the backup still runs, and the job is marked "completed with warnings". On: the plugin failing stops the backup entirely — use it when an archive without this plugin\'s output would be worthless. With a plan that streams database dumps, a dump that fails while borg is already running cannot stop it; the job is marked "completed with warnings".',
         ];
 
         return $schema;
