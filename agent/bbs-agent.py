@@ -54,7 +54,7 @@ if not hasattr(subprocess, "run"):
     subprocess.run = _subprocess_run
     subprocess.CompletedProcess = _CompletedProcess
 
-AGENT_VERSION = "2.99.0"
+AGENT_VERSION = "2.99.1"
 
 # Ed25519 public keys, hex, that may sign an update to this script and to
 # the start wrapper. Kept in step with agent/signing-key.pub. An update the
@@ -2186,7 +2186,7 @@ class DumpStreams(object):
 
     def add(self, path, name, cmd, env, describe_error):
         self.streams.append({
-            "path": path, "name": name, "cmd": cmd, "env": env, "run": None,
+            "path": path, "name": name, "cmd": cmd, "env": env, "run": None, "waiting": False, "listed": [], "ino": None,
             "describe_error": describe_error,
             "opened": False, "bytes": 0, "error": None, "thread": None, "proc": None,
         })
@@ -2207,13 +2207,42 @@ class DumpStreams(object):
                 s["error"] = s["describe_error"](stderr.strip() or "exited with code {}".format(rc))
         self.on_disk = True
 
-    def start(self):
-        """Make the pipes and start a writer for each. Each writer waits
-        until borg opens its pipe, then runs the dump into it."""
+    def make_pipes(self):
+        """Create the pipes. Done before the special-file scan, so that a
+        pipe reachable through a second path (a symlinked or bind-mounted
+        parent) is found there and excluded under every other name."""
         for s in self.streams:
             if os.path.lexists(s["path"]):
                 os.remove(s["path"])
             os.mkfifo(s["path"], 0o600)
+            st = os.stat(s["path"])
+            s["ino"] = (st.st_dev, st.st_ino)
+
+    def note_listed(self, path, status):
+        """Called for each item borg lists. Records the paths each pipe was
+        stored under, matched by inode, so a pipe reached through a second
+        path is caught whatever the reason."""
+        if not path.endswith(".sql") or (status[:1].lower() in ("x", "e")):
+            return
+        full = path if path.startswith("/") else "/" + path
+        try:
+            st = os.stat(full)
+        except OSError:
+            return
+        for s in self.streams:
+            if s.get("ino") == (st.st_dev, st.st_ino):
+                s["listed"].append(os.path.normpath(full))
+                return
+
+    def size_of(self, st):
+        for s in self.streams:
+            if s.get("ino") == (st.st_dev, st.st_ino):
+                return s["bytes"]
+        return None
+
+    def start(self):
+        """Start a writer for each pipe. Each writer waits until borg opens
+        its pipe, then runs the dump into it."""
         for s in self.streams:
             t = threading.Thread(target=self._feed, args=(s,), name="bbs-stream-{}".format(s["name"]))
             t.daemon = True
@@ -2221,20 +2250,36 @@ class DumpStreams(object):
             t.start()
         self._started = True
 
+    def _wait_for_reader(self, s):
+        """Block until borg opens the pipe. Returns the write end, or None
+        once finish() has released the wait."""
+        with self._lock:
+            if self._done:
+                return None
+            s["waiting"] = True
+        try:
+            fd = os.open(s["path"], os.O_WRONLY)
+        finally:
+            with self._lock:
+                s["waiting"] = False
+                done = self._done
+        if done:
+            os.close(fd)
+            return None
+        return fd
+
     def _feed(self, s):
         try:
-            fd = os.open(s["path"], os.O_WRONLY)  # waits for borg
+            fd = self._wait_for_reader(s)
         except OSError as e:
             s["error"] = s["describe_error"]("could not open the pipe: {}".format(e))
             return
+        if fd is None:
+            s["error"] = s["describe_error"](
+                "borg did not read it (is the dump directory matched by an exclude pattern?)")
+            return
+        s["opened"] = True
         try:
-            with self._lock:
-                s["opened"] = True
-                abandoned = self._done
-            if abandoned:
-                s["error"] = s["describe_error"](
-                    "borg did not read it (is the dump directory matched by an exclude pattern?)")
-                return
             logger.info("Streaming database {} into the archive".format(s["name"]))
             with tempfile.TemporaryFile() as errf:
                 proc = subprocess.Popen(s["cmd"], stdout=subprocess.PIPE, stderr=errf, env=s["env"])
@@ -2265,18 +2310,33 @@ class DumpStreams(object):
         finally:
             os.close(fd)
 
+        # Borg should read each pipe once. If it opens it again (the dump
+        # directory reached through a path the scan could not see), a pipe
+        # with no writer would block borg forever, so answer any further
+        # open with an empty read. This can also pair with borg's read end
+        # of the first visit while it is still open, so it proves nothing;
+        # report() checks borg's own list of what it stored instead.
+        while True:
+            try:
+                fd = self._wait_for_reader(s)
+            except OSError:
+                break
+            if fd is None:
+                break
+            os.close(fd)
+
     def finish(self):
-        """After borg has exited: release writers borg never reached, wait
-        for the rest, remove the pipes. Never raises."""
+        """After borg has exited: release writers still waiting for borg,
+        wait for the rest, remove the pipes. Never raises."""
         try:
             if self._started:
                 with self._lock:
                     self._done = True
-                    unread = [s for s in self.streams if not s["opened"]]
+                    waiting = [s for s in self.streams if s.get("waiting")]
                 # Opening the read end lets a waiting writer's open() return;
                 # it sees the job is done and closes without dumping.
                 readers = []
-                for s in unread:
+                for s in waiting:
                     try:
                         readers.append(os.open(s["path"], os.O_RDONLY | os.O_NONBLOCK))
                     except OSError:
@@ -2315,6 +2375,16 @@ class DumpStreams(object):
                 continue
             ok = []
             for s in mine:
+                if not s["error"] and not self.on_disk:
+                    want = os.path.normpath(s["path"])
+                    others = sorted(set(p for p in s["listed"] if p != want))
+                    if others:
+                        s["error"] = s["describe_error"](
+                            "the dump directory is also reachable as {} in this plan, so borg read the pipe there too "
+                            "and the copy at {} may be empty".format(", ".join(others), want))
+                    elif s["listed"].count(want) != 1:
+                        s["error"] = s["describe_error"](
+                            "borg stored it {} times at {}, expected once".format(s["listed"].count(want), want))
                 if s["error"]:
                     log_to_server(self.config, self.job_id, "Database {} not backed up: {}".format(s["name"], s["error"]))
                     failures.append({"slug": run.get("slug"), "config_name": run.get("config_name"),
@@ -2400,13 +2470,51 @@ def _special_files(directories, excludes, keep, one_file_system):
 _SPECIAL_FILES_MAX = 2000
 
 
+def _without_covered_dump_roots(command, pipe_paths, one_file_system):
+    """Drop a dump directory from borg's paths when another path in the same
+    command already contains it. The server adds the dump directory as its
+    own path; with /home/bbs in the plan as well, borg would walk
+    /home/bbs/mysql twice and open each pipe twice, under the same name, so
+    no exclude could tell the visits apart."""
+    if "--" not in command:
+        return command
+    at = command.index("--") + 1
+    roots = command[at:]
+    dump_dirs = {os.path.normpath(os.path.dirname(p)) for p in pipe_paths}
+    kept = []
+    for i, root in enumerate(roots):
+        norm = os.path.normpath(root)
+        if norm in dump_dirs:
+            covered = False
+            for j, other in enumerate(roots):
+                o = os.path.normpath(other)
+                if j == i or not (o == "/" or norm.startswith(o.rstrip("/") + "/") or (o == norm and j < i)):
+                    continue
+                if one_file_system:
+                    try:
+                        if os.stat(o).st_dev != os.stat(norm).st_dev:
+                            continue
+                    except OSError:
+                        continue
+                covered = True
+                break
+            if covered:
+                continue
+        kept.append(root)
+    return command[:at] + kept
+
+
 def _prepare_streaming(config, job_id, command, directories, streams):
     """Make the borg command safe for --read-special, start the pipes, and
     return the command to run. Falls back to dump files if any step fails."""
     try:
         t0 = time.time()
+        one_fs = "--one-file-system" in command
+        command = _without_covered_dump_roots(command, streams.paths(), one_fs)
+        directories = "\n".join(command[command.index("--") + 1:]) if "--" in command else directories
+        streams.make_pipes()
         excludes = "\n".join(t[len("--exclude="):] for t in command if t.startswith("--exclude="))
-        specials = _special_files(directories, excludes, streams.paths(), "--one-file-system" in command)
+        specials = _special_files(directories, excludes, streams.paths(), one_fs)
         logger.info("Special-file check took {:.1f}s, found {}".format(time.time() - t0, len(specials)))
         if len(specials) > _SPECIAL_FILES_MAX:
             raise RuntimeError("{} pipes or device files under the plan's directories; exclude them to stream".format(len(specials)))
@@ -5427,6 +5535,9 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
                 entry = json.loads(line)
                 msg_type = entry.get("type", "")
 
+                if streams is not None and streams.streams and msg_type in ("file_status", "file_item"):
+                    streams.note_listed(entry.get("path", ""), entry.get("status") or "")
+
                 if msg_type == "archive_progress":
                     files_processed = entry.get("nfiles", files_processed)
                     original_size = entry.get("original_size", original_size)
@@ -5565,6 +5676,8 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
                                 stat_path = "/" + fpath if not fpath.startswith("/") else fpath
                             st = os.stat(stat_path)
                             fsize = st.st_size
+                            if streams is not None and stat.S_ISFIFO(st.st_mode):
+                                fsize = streams.size_of(st) or fsize  # a pipe has no size of its own
                             fmtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
                         except (OSError, UnicodeEncodeError):
                             pass
@@ -6183,4 +6296,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-# bbs-signature: v1 U3sMQUfYXPMt9ywkTcRGF+3L81vUKO/fP/3xJ6Zkm9BM0NeQhsNEiTiFdg/gM/ZPOcpWugIjt2Msts1SdAy8Bw==
+# bbs-signature: v1 Cm8u9BWOrLR4/U5/rwbslIP1TFV1b6aCfbQK1lTTJr3Xx9haoFmOLuw7IghG8rgfsbdyvuTqW5zw/sC9B5BSAw==
