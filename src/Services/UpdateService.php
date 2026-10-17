@@ -432,6 +432,12 @@ class UpdateService
         $processRunning = false;
         if (!empty($pid) && is_numeric($pid)) {
             $processRunning = file_exists("/proc/{$pid}");
+            // After a reboot the PID can belong to something else. Only count
+            // it if it's still the updater (when its command line is readable).
+            $cmdline = $processRunning ? @file_get_contents("/proc/{$pid}/cmdline") : false;
+            if ($cmdline !== false && $cmdline !== '' && !str_contains($cmdline, 'bbs-update')) {
+                $processRunning = false;
+            }
         }
 
         // Check for completion marker
@@ -457,10 +463,11 @@ class UpdateService
         }
 
         // The process is gone and left no log we can read. Don't wait forever:
-        // judge by whether the code on disk is now the version we asked for.
+        // judge by whether the code on disk is now the version we asked for,
+        // or a newer one (someone ran bbs-update by hand to get unstuck).
         if (!$processRunning && $log === '') {
             $wanted = ltrim($target, 'v');
-            if ($wanted !== '' && $wanted === $this->getCurrentVersion()) {
+            if ($wanted !== '' && version_compare($this->getCurrentVersion(), $wanted, '>=')) {
                 $fallbackSuccess = true;
             }
         }
