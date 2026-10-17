@@ -984,6 +984,23 @@ class AdminApiController extends Controller
             $this->json(['error' => 'Client not found'], 404);
         }
 
+        // A template supplies directories, excludes and advanced options, the
+        // same fields the web form fills from one. Any of them sent in the
+        // request overrides the template's value (#544).
+        $templateId = null;
+        if (isset($input['template_id']) && $input['template_id'] !== '') {
+            $template = $this->db->fetchOne("SELECT id, directories, excludes, advanced_options FROM backup_templates WHERE id = ?", [(int) $input['template_id']]);
+            if (!$template) {
+                $this->json(['error' => 'Backup template not found'], 404);
+            }
+            $templateId = (int) $template['id'];
+            foreach (['directories', 'excludes', 'advanced_options'] as $field) {
+                if (!array_key_exists($field, $input) && ($template[$field] ?? '') !== '') {
+                    $input[$field] = $template[$field];
+                }
+            }
+        }
+
         $name = trim($input['name'] ?? '');
         $repositoryId = (int) ($input['repository_id'] ?? 0);
         $directories = trim($input['directories'] ?? '');
@@ -1002,7 +1019,7 @@ class AdminApiController extends Controller
         $pruneYears = (int) ($input['prune_years'] ?? 0);
 
         if (empty($name) || empty($directories) || empty($repositoryId)) {
-            $this->json(['error' => 'name, repository_id, and directories are required'], 400);
+            $this->json(['error' => 'name, repository_id, and directories (or a template_id) are required'], 400);
         }
         if (($fieldError = \BBS\Services\BorgCommandBuilder::validatePlanFields($advancedOptions, $directories)) !== null) {
             $this->json(['error' => $fieldError], 422);
@@ -1131,6 +1148,9 @@ class AdminApiController extends Controller
             'name' => $name,
             'repository_id' => $repositoryId,
             'directories' => $directories,
+            'excludes' => $excludes,
+            'advanced_options' => $advancedOptions,
+            'template_id' => $templateId,
             'frequency' => $frequency,
             'schedule_id' => (int) $scheduleId,
             'plugins_attached' => $order,
