@@ -4805,7 +4805,10 @@ def _mssql_restore_one(mssql, dump_dir, db_name, mode, target, safety_dir, job_i
                         "(or restore it under a new name)".format(target))
 
     q_target = _mssql_quote_name(target)
-    exists = bool(_mssql_run(mssql, "SELECT DB_ID({})".format(_mssql_quote_str(target)), timeout=30)[0][0] not in ("", "NULL"))
+    # CASE, not a bare DB_ID: for a missing database DB_ID is NULL, which the
+    # PowerShell client prints as an empty line (no row at all after parsing)
+    rows = _mssql_run(mssql, "SELECT CASE WHEN DB_ID({}) IS NULL THEN 0 ELSE 1 END".format(_mssql_quote_str(target)), timeout=30)
+    exists = bool(rows) and rows[0][0].strip() == "1"
 
     if mode == "rename" and exists:
         raise Exception("a database named {} already exists on the server; pick another name".format(target))
