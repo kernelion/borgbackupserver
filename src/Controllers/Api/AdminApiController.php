@@ -2670,7 +2670,7 @@ class AdminApiController extends Controller
               AND {$agentWhere}
             GROUP BY hour, bj.task_type, bj.status", $agentParams);
 
-        $restoreTypes = ['restore', 'restore_mysql', 'restore_pg', 'restore_mongo'];
+        $restoreTypes = ['restore', 'restore_mysql', 'restore_pg', 'restore_mongo', 'restore_mssql'];
         $buckets = [];
         foreach ($rows as $row) {
             $h = $row['hour'];
@@ -4611,7 +4611,7 @@ class AdminApiController extends Controller
         ]);
 
         // Auto-queue a break-lock to clean up any stale borg lock
-        if ($job['repository_id'] && in_array($job['task_type'], ['backup', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo'])) {
+        if ($job['repository_id'] && in_array($job['task_type'], ['backup', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo', 'restore_mssql'])) {
             $this->db->insert('backup_jobs', [
                 'agent_id' => $job['agent_id'],
                 'repository_id' => $job['repository_id'],
@@ -5166,12 +5166,12 @@ class AdminApiController extends Controller
         $rows = $this->db->fetchAll(
             "SELECT pc.id, pc.name, pc.config, p.slug
              FROM plugin_configs pc JOIN plugins p ON p.id = pc.plugin_id
-             WHERE pc.agent_id = ? AND p.slug IN ('mysql_dump', 'pg_dump', 'mongo_dump')
+             WHERE pc.agent_id = ? AND p.slug IN ('mysql_dump', 'pg_dump', 'mongo_dump', 'mssql_dump')
              ORDER BY p.slug, pc.name",
             [$id]
         );
 
-        $typeBySlug = ['mysql_dump' => 'mysql', 'pg_dump' => 'postgres', 'mongo_dump' => 'mongo'];
+        $typeBySlug = ['mysql_dump' => 'mysql', 'pg_dump' => 'postgres', 'mongo_dump' => 'mongo', 'mssql_dump' => 'mssql'];
         $connectors = [];
         foreach ($rows as $r) {
             $cfg = json_decode($r['config'] ?? '{}', true) ?: [];
@@ -5220,7 +5220,7 @@ class AdminApiController extends Controller
             "SELECT pc.id, pc.name, p.slug FROM plugin_configs pc
              JOIN plugins p ON p.id = pc.plugin_id
              WHERE pc.id = ? AND pc.agent_id = ?
-               AND p.slug IN ('mysql_dump', 'pg_dump', 'mongo_dump')",
+               AND p.slug IN ('mysql_dump', 'pg_dump', 'mongo_dump', 'mssql_dump')",
             [$connectorId, $id]
         );
         if (!$connector) {
@@ -5262,6 +5262,7 @@ class AdminApiController extends Controller
             'mysql_dump' => 'restore_mysql',
             'pg_dump' => 'restore_pg',
             'mongo_dump' => 'restore_mongo',
+            'mssql_dump' => 'restore_mssql',
         };
 
         $jobId = $this->db->insert('backup_jobs', [
