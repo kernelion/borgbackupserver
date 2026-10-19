@@ -4855,6 +4855,34 @@ def _mssql_restore_one(mssql, dump_dir, db_name, mode, target, safety_dir, job_i
     return "{} -> {}{}".format(db_name, target, note)
 
 
+def _mssql_restore_borg_env(env_vars):
+    """Environment for the borg extract of a SQL Server restore: what
+    execute_task builds for a file restore. On Windows the server's BORG_RSH
+    names Unix paths (/tmp/bbs-remote-ssh-key, /etc/bbs-agent/ssh_key) and
+    the system ssh; without translating them ssh cannot find its key and
+    the connection is closed."""
+    env = os.environ.copy()
+    env.update(env_vars)
+    if IS_WINDOWS and "BORG_RSH" in env:
+        env["BORG_RSH"] = env["BORG_RSH"].replace(
+            "/etc/bbs-agent/ssh_key", SSH_KEY_PATH.replace("\\", "/")
+        ).replace(
+            "/tmp/bbs-remote-ssh-key", REMOTE_KEY_PATH.replace("\\", "/")
+        )
+        if SSH_CMD != "ssh" and env["BORG_RSH"].startswith("ssh "):
+            env["BORG_RSH"] = '"' + SSH_CMD + '"' + env["BORG_RSH"][3:]
+    if IS_DROPBEAR and "BORG_RSH" in env:
+        env["BORG_RSH"] = _rewrite_borg_rsh_for_dropbear(env["BORG_RSH"])
+    elif "BORG_RSH" in env:
+        env["BORG_RSH"] = env["BORG_RSH"].replace("LogLevel=ERROR", "LogLevel=INFO")
+    env["BORG_RELOCATED_REPO_ACCESS_IS_OK"] = "yes"
+    env["BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK"] = "yes"
+    if not IS_WINDOWS and ("LC_ALL" not in env or not env["LC_ALL"].endswith("UTF-8")):
+        env["LC_ALL"] = "C.UTF-8"
+        env["LANG"] = "C.UTF-8"
+    return env
+
+
 def execute_restore_mssql(config, task):
     """Restore SQL Server databases from a borg archive."""
     job_id = task.get("job_id")
@@ -4902,8 +4930,7 @@ def execute_restore_mssql(config, task):
     logger.info("Job #{}: Extracting SQL Server backups from archive".format(job_id))
     if cwd:
         os.makedirs(cwd, exist_ok=True)
-    env = os.environ.copy()
-    env.update(env_vars)
+    env = _mssql_restore_borg_env(env_vars)
     try:
         proc = subprocess.run(command, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=6 * 3600)
         if proc.returncode > 1:
