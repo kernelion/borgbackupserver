@@ -22,10 +22,11 @@
 
     var SYSTEM_DBS = ['master', 'model', 'msdb'];
 
+    // For text placed between tags (status messages). Quotes are escaped too
+    // so the result is also safe inside an attribute, should it ever be used there.
     function esc(s) {
-        var d = document.createElement('div');
-        d.textContent = String(s);
-        return d.innerHTML;
+        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
     function parseList(value) {
@@ -95,6 +96,37 @@
             .catch(function () { fail('Error contacting the server.'); });
     };
 
+    // One checkbox row, built with the DOM API. Database names come from the
+    // SQL Server and may contain any character (quotes included), so nothing
+    // is ever concatenated into markup: value, id and text are set as
+    // properties.
+    function makeRow(opts) {
+        var row = document.createElement('div');
+        row.className = 'form-check';
+        var box = document.createElement('input');
+        box.className = 'form-check-input db-picker-item';
+        box.type = 'checkbox';
+        box.value = opts.name;
+        if (opts.id) box.id = opts.id;
+        if (opts.comma) box.dataset.comma = '1';
+        box.checked = !!opts.checked;
+        box.disabled = !!opts.disabled;
+        row.appendChild(box);
+        var label = document.createElement('label');
+        label.className = 'form-check-label small font-monospace' + (opts.warn ? ' text-warning' : '');
+        if (opts.id) label.htmlFor = opts.id;
+        label.textContent = opts.name;
+        row.appendChild(label);
+        (opts.notes || []).forEach(function (n) {
+            row.appendChild(document.createTextNode(' '));
+            var span = document.createElement('span');
+            span.className = n.className;
+            span.textContent = n.text;
+            row.appendChild(span);
+        });
+        return row;
+    }
+
     // Draw the checkboxes from the databases found and the field's current value.
     Picker.prototype.render = function () {
         var cur = parseList(this.input.value);
@@ -102,29 +134,39 @@
         cur.names.forEach(function (n) { chosen[n.toLowerCase()] = true; });
         this.all.checked = cur.all;
         var known = {};
-        var html = '';
+        var rows = document.createDocumentFragment();
+        var configId = this.wrap.dataset.configId;
         this.databases.forEach(function (name, i) {
             known[name.toLowerCase()] = true;
             var comma = name.indexOf(',') !== -1;
-            var system = SYSTEM_DBS.indexOf(name.toLowerCase()) !== -1;
-            html += '<div class="form-check">' +
-                '<input class="form-check-input db-picker-item" type="checkbox" id="dbp_' + esc(this.wrap.dataset.configId) + '_' + i + '"' +
-                ' value="' + esc(name) + '"' + (comma ? ' data-comma="1"' : '') +
-                ((cur.all || (!comma && chosen[name.toLowerCase()])) ? ' checked' : '') +
-                (cur.all || comma ? ' disabled' : '') + '>' +
-                '<label class="form-check-label small font-monospace" for="dbp_' + esc(this.wrap.dataset.configId) + '_' + i + '">' + esc(name) + '</label>' +
-                (system ? ' <span class="badge text-bg-secondary">system</span>' : '') +
-                (comma ? ' <span class="text-muted small">(name contains a comma: only selectable through *)</span>' : '') +
-                '</div>';
-        }, this);
-        // Names typed by hand that the server did not report stay visible
-        var missing = cur.names.filter(function (n) { return !known[n.toLowerCase()]; });
-        missing.forEach(function (n) {
-            html += '<div class="form-check"><input class="form-check-input db-picker-item" type="checkbox" checked value="' + esc(n) + '">' +
-                '<label class="form-check-label small font-monospace text-warning">' + esc(n) + '</label> ' +
-                '<span class="text-warning small">not found on the server</span></div>';
+            var notes = [];
+            if (SYSTEM_DBS.indexOf(name.toLowerCase()) !== -1) notes.push({ className: 'badge text-bg-secondary', text: 'system' });
+            if (comma) notes.push({ className: 'text-muted small', text: '(name contains a comma: only selectable through *)' });
+            rows.appendChild(makeRow({
+                name: name,
+                id: 'dbp_' + configId + '_' + i,
+                comma: comma,
+                checked: cur.all || (!comma && chosen[name.toLowerCase()]),
+                disabled: cur.all || comma,
+                notes: notes
+            }));
         });
-        this.list.innerHTML = html || '<div class="text-muted small">No databases found.</div>';
+        // Names typed by hand that the server did not report stay visible
+        cur.names.filter(function (n) { return !known[n.toLowerCase()]; }).forEach(function (n) {
+            rows.appendChild(makeRow({
+                name: n, checked: true, warn: true,
+                notes: [{ className: 'text-warning small', text: 'not found on the server' }]
+            }));
+        });
+        this.list.textContent = '';
+        if (rows.childNodes.length) {
+            this.list.appendChild(rows);
+        } else {
+            var empty = document.createElement('div');
+            empty.className = 'text-muted small';
+            empty.textContent = 'No databases found.';
+            this.list.appendChild(empty);
+        }
         this.panel.hidden = false;
     };
 

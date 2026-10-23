@@ -741,6 +741,18 @@ class PluginManager
                     'label' => 'Delete .bak files after backup completes',
                     'default' => true,
                 ],
+                'safety_backup' => [
+                    'type' => 'checkbox',
+                    'label' => 'Safety backup before Replace',
+                    'default' => true,
+                    'help' => 'When a restore replaces an existing database, back the current one up first (to <dump directory>_pre_restore). If that backup fails the database is left untouched. Switch off only if you accept having no way back.',
+                ],
+                'safety_keep_days' => [
+                    'type' => 'number',
+                    'label' => 'Keep safety backups (days)',
+                    'default' => 7,
+                    'help' => 'Safety backups older than this are deleted after the next one is made. 0 keeps them forever (they are never cleaned up otherwise, so mind the disk).',
+                ],
                 'trust_cert' => [
                     'type' => 'checkbox',
                     'label' => 'Trust server certificate',

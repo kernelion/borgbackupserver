@@ -1336,6 +1336,8 @@ class QueueManager
                 'dump_dir' => $dumpDir,
                 'compress' => $mssqlConfig['compress'] ?? false,
                 'cleanup_after' => $mssqlConfig['cleanup_after'] ?? true,
+                'safety_backup' => $mssqlConfig['safety_backup'] ?? true,
+                'safety_keep_days' => $mssqlConfig['safety_keep_days'] ?? 7,
             ],
         ];
 
